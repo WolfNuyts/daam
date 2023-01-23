@@ -8,6 +8,7 @@ import numpy as np
 import PIL.Image as Image
 import torch
 import torch.nn.functional as F
+from matplotlib import pyplot as plt
 
 from .utils import cache_dir, auto_autocast
 from .experiment import GenerationExperiment
@@ -218,7 +219,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         maps = torch.stack(maps, 0)  # shape: (tokens, heads, height, width)
         return maps.permute(1, 0, 2, 3).contiguous()  # shape: (heads, tokens, height, width)
 
-    def _hooked_sliced_attention(hk_self, self, query, key, value, sequence_length, dim):
+    def _hooked_sliced_attention(hk_self, self, query, key, value, sequence_length, dim, attention_mask):
         batch_size_attention = query.shape[0]
         hidden_states = torch.zeros(
             (batch_size_attention, sequence_length, dim // self.heads), device=query.device, dtype=query.dtype
@@ -258,7 +259,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
     def _load_attn(self) -> torch.Tensor:
         return torch.load(self.data_dir / f'{self.trace._gen_idx}.pt')
 
-    def _hooked_attention(hk_self, self, query, key, value):
+    def _hooked_attention(hk_self, self, query, key, value, attention_mask):
         """
         Monkey-patched version of :py:func:`.CrossAttention._attention` to capture attentions and aggregate them.
 
@@ -301,7 +302,84 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
         return hidden_states
 
+    def _hooked_focused_attention(hk_self, self, query, key, value, focused_attention_mask, focused_attention_norm, attention_mask):
+        maximize_over_heads = False
+        maximize_with_mean = False
+        step_value = None
+        replace_att = True
+
+        focused_attention_mask, w_mask = focused_attention_mask
+        focused_attention_mask, w_mask = torch.repeat_interleave(focused_attention_mask, self.heads, dim=0), \
+                                         torch.repeat_interleave(w_mask, self.heads, dim=0)
+
+        attention_scores = torch.baddbmm(
+            torch.empty(query.shape[0], query.shape[1], key.shape[1], dtype=query.dtype, device=query.device),
+            query,
+            key.transpose(-1, -2),
+            beta=0,
+            alpha=self.scale,
+        )
+        focus_weights = torch.bmm(attention_scores, focused_attention_mask)
+
+
+        # only active on the activated words -> need for better way of handling
+        if replace_att:
+            mask =  ~torch.repeat_interleave(w_mask.bool().unsqueeze(1), focus_weights.size(1), dim=1)
+            focus_weights[mask] = attention_scores[mask]
+            attention_scores = torch.ones_like(attention_scores)
+        else:
+            focus_weights = torch.clamp(focus_weights, min=0)
+            if focused_attention_norm is not None:
+                focus_weights = focused_attention_norm(focus_weights)
+            # use min-max normalization
+            else:
+                focus_weights /= attention_scores[:, :, 1:].max(dim=-1, keepdim=True).values
+            focus_weights = torch.maximum(focus_weights, torch.logical_not(w_mask)[:, None, :])
+
+        if maximize_over_heads:
+            focus_weights = focus_weights.reshape(-1, self.heads, *focus_weights.shape[1:])
+            if maximize_with_mean:
+                focus_weights = focus_weights.mean(dim=1)
+            else:
+                focus_weights = focus_weights.max(dim=1)[0]
+            focus_weights = torch.repeat_interleave(focus_weights, self.heads, dim=0)
+
+        if step_value is not None:
+            focus_weights = torch.where(focus_weights > step_value, torch.ones_like(focus_weights), torch.zeros_like(focus_weights))
+
+        #focus_weights /= focus_weights.max(dim=1, keepdim=True).values
+
+        '''plot_att = True
+        if plot_att == True:
+            plt.imshow(focus_weights[5, : , 5].cpu().numpy().reshape(64,64))
+            plt.show()'''
+
+        attn_slice = (focus_weights * attention_scores).softmax(dim=-1)
+
+        if hk_self.save_heads:
+            hk_self._save_attn(attn_slice)
+        elif hk_self.load_heads:
+            attn_slice = hk_self._load_attn()
+
+        factor = int(math.sqrt(hk_self.latent_hw // attn_slice.shape[1]))
+        hk_self.trace._gen_idx += 1
+
+        if attn_slice.shape[-1] == hk_self.context_size and factor != 8:
+            # shape: (batch_size, 64 // factor, 64 // factor, 77)
+            maps = hk_self._unravel_attn(attn_slice)
+
+            for head_idx, heatmap in enumerate(maps):
+                hk_self.heat_maps.update(factor, hk_self.layer_idx, head_idx, heatmap)
+
+        # compute attention output
+        hidden_states = torch.bmm(attn_slice, value)
+
+        # reshape hidden_states
+        hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
+        return hidden_states
+
     def _hook_impl(self):
+        self.monkey_patch('_focused_attention', self._hooked_focused_attention)
         self.monkey_patch('_attention', self._hooked_attention)
         self.monkey_patch('_sliced_attention', self._hooked_sliced_attention)
 
