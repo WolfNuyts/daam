@@ -27,7 +27,8 @@ class DiffusionHeatMapHooker(AggregateHooker):
             low_memory: bool = False,
             load_heads: bool = False,
             save_heads: bool = False,
-            data_dir: str = None
+            data_dir: str = None,
+            foc_att_args=None,
     ):
         self.all_heat_maps = RawHeatMapCollection()
         h = (pipeline.unet.config.sample_size * pipeline.vae_scale_factor)
@@ -47,7 +48,8 @@ class DiffusionHeatMapHooker(AggregateHooker):
                 latent_hw=self.latent_hw,
                 load_heads=load_heads,
                 save_heads=save_heads,
-                data_dir=data_dir
+                data_dir=data_dir,
+                foc_att_args=foc_att_args,
             ) for idx, x in enumerate(self.locator.locate(pipeline.unet))
         ]
 
@@ -173,6 +175,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
             load_heads: bool = False,
             save_heads: bool = False,
             data_dir: Union[str, Path] = None,
+            foc_att_args=None,
     ):
         super().__init__(module)
         self.heat_maps = parent_trace.all_heat_maps
@@ -183,6 +186,8 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         self.load_heads = load_heads
         self.save_heads = save_heads
         self.trace = parent_trace
+
+        self.foc_att_args = foc_att_args
 
         if data_dir is not None:
             data_dir = Path(data_dir)
@@ -303,10 +308,10 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         return hidden_states
 
     def _hooked_focused_attention(hk_self, self, query, key, value, focused_attention_mask, focused_attention_norm, attention_mask):
-        maximize_over_heads = False
-        maximize_with_mean = False
-        step_value = None
-        replace_att = True
+        maximize_over_heads =  hk_self.foc_att_args.maximize_over_heads
+        maximize_with_mean =  hk_self.foc_att_args.maximize_with_mean
+        step_value =  hk_self.foc_att_args.step_value
+        replace_att =  hk_self.foc_att_args.replace_att
 
         focused_attention_mask, w_mask = focused_attention_mask
         focused_attention_mask, w_mask = torch.repeat_interleave(focused_attention_mask, self.heads, dim=0), \
@@ -336,16 +341,16 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
                 focus_weights /= attention_scores[:, :, 1:].max(dim=-1, keepdim=True).values
             focus_weights = torch.maximum(focus_weights, torch.logical_not(w_mask)[:, None, :])
 
-        if maximize_over_heads:
-            focus_weights = focus_weights.reshape(-1, self.heads, *focus_weights.shape[1:])
-            if maximize_with_mean:
-                focus_weights = focus_weights.mean(dim=1)
-            else:
-                focus_weights = focus_weights.max(dim=1)[0]
-            focus_weights = torch.repeat_interleave(focus_weights, self.heads, dim=0)
+            if maximize_over_heads:
+                focus_weights = focus_weights.reshape(-1, self.heads, *focus_weights.shape[1:])
+                if maximize_with_mean:
+                    focus_weights = focus_weights.mean(dim=1)
+                else:
+                    focus_weights = focus_weights.max(dim=1)[0]
+                focus_weights = torch.repeat_interleave(focus_weights, self.heads, dim=0)
 
-        if step_value is not None:
-            focus_weights = torch.where(focus_weights > step_value, torch.ones_like(focus_weights), torch.zeros_like(focus_weights))
+            if step_value is not None:
+                focus_weights = torch.where(focus_weights > step_value, torch.ones_like(focus_weights), torch.zeros_like(focus_weights))
 
         #focus_weights /= focus_weights.max(dim=1, keepdim=True).values
 
