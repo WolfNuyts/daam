@@ -54,6 +54,7 @@ class DiffusionHeatMapHooker(AggregateHooker):
         ]
 
         modules.append(PipelineHooker(pipeline, self))
+        self.cross_att_hookers = modules[:-1]
 
         super().__init__(modules)
         self.pipe = pipeline
@@ -131,6 +132,14 @@ class DiffusionHeatMapHooker(AggregateHooker):
 
         return GlobalHeatMap(self.pipe.tokenizer, prompt, maps)
 
+    def compute_word_attention_importance(self):
+        nb_layers, nb_steps, nb_words = len(self.cross_att_hookers), len(self.cross_att_hookers[0].att_cum[0]), len(self.cross_att_hookers[0].att_cum)
+        res = np.zeros((nb_words, nb_steps, nb_layers))
+        for module in self.cross_att_hookers :
+            for word_idx in module.att_cum:
+                res[word_idx, :, module.layer_idx] = np.array(module.att_cum[word_idx])
+        return res
+
 
 class PipelineHooker(ObjectHooker[StableDiffusionPipeline]):
     def __init__(self, pipeline: StableDiffusionPipeline, parent_trace: 'trace'):
@@ -188,6 +197,8 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         self.trace = parent_trace
 
         self.foc_att_args = foc_att_args
+
+        self.att_cum = {}
 
         if data_dir is not None:
             data_dir = Path(data_dir)
@@ -290,6 +301,11 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         elif hk_self.load_heads:
             attn_slice = hk_self._load_attn()
 
+        if hk_self.foc_att_args.save_cum_att:
+            att_cum = attn_slice.mean(dim=[0,1])
+            for i in range(att_cum.size(0)):
+                hk_self.att_cum.setdefault(i, []).append(att_cum[i].item())
+
         factor = int(math.sqrt(hk_self.latent_hw // attn_slice.shape[1]))
         hk_self.trace._gen_idx += 1
 
@@ -365,6 +381,11 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
             hk_self._save_attn(attn_slice)
         elif hk_self.load_heads:
             attn_slice = hk_self._load_attn()
+
+        if hk_self.foc_att_args.save_cum_att:
+            att_cum = attn_slice.mean(dim=[0,1])
+            for i in range(att_cum.size(0)):
+                hk_self.att_cum.setdefault(i, []).append(att_cum[i].item())
 
         factor = int(math.sqrt(hk_self.latent_hw // attn_slice.shape[1]))
         hk_self.trace._gen_idx += 1
