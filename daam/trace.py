@@ -142,6 +142,15 @@ class DiffusionHeatMapHooker(AggregateHooker):
                 res_unc[word_idx, :, module.layer_idx] = np.array(module.att_cum_unc[word_idx])
         return res, res_unc
 
+    def get_attention_maps(self):
+        res = torch.tensor([])
+        for module in self.cross_att_hookers:
+            mod_maps = torch.stack(module.att_maps, dim=0).cpu().unsqueeze(0).mean(dim=-3)
+            res = torch.cat([res, mod_maps], dim=0)
+
+        res = res.permute(2,1,0,3,4) #tokens, steps, layers, height, width
+        return res
+
 
 class PipelineHooker(ObjectHooker[StableDiffusionPipeline]):
     def __init__(self, pipeline: StableDiffusionPipeline, parent_trace: 'trace'):
@@ -202,6 +211,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
 
         self.att_cum = {}
         self.att_cum_unc = {}
+        self.att_maps = []
 
         if data_dir is not None:
             data_dir = Path(data_dir)
@@ -210,6 +220,17 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
 
         self.data_dir = data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
+
+
+    def _show_att_map(self, x):
+        h = w = int(math.sqrt(x.size(1)))
+        x = x[x.size(0)//2 :].mean(axis=0).squeeze(0)
+        x = x.permute(1, 0)
+        for i, map_ in enumerate(x):
+            map_ = map_.view(h, w).cpu().numpy()
+            plt.imshow(map_, cmap='hot', interpolation='nearest')
+            plt.title(i)
+            plt.show()
 
     @torch.no_grad()
     def _unravel_attn(self, x):
@@ -257,7 +278,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
             attn_slice = attn_slice.softmax(dim=-1)
             factor = int(math.sqrt(hk_self.latent_hw // attn_slice.shape[1]))
 
-            if attn_slice.shape[-1] == hk_self.context_size:
+            if attn_slice.shape[-1] <= hk_self.context_size:
                 # shape: (batch_size, 64 // factor, 64 // factor, 77)
                 maps = hk_self._unravel_attn(attn_slice)
 
@@ -307,6 +328,9 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         if hk_self.foc_att_args.save_cum_att:
             att_cum_unc = attn_slice[:attn_slice.size(0) // 2].mean(dim=[0,1])
             att_cum = attn_slice[attn_slice.size(0) // 2:].mean(dim=[0,1])
+            maps = hk_self._unravel_attn(attn_slice).transpose(0,1) #tokens, heads, height, width
+            maps = F.interpolate(maps, size=(64, 64), mode='bicubic')
+            hk_self.att_maps.append(maps)
             for i in range(att_cum.size(0)):
                 hk_self.att_cum.setdefault(i, []).append(att_cum[i].item())
                 hk_self.att_cum_unc.setdefault(i, []).append(att_cum_unc[i].item())
@@ -315,7 +339,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         factor = int(math.sqrt(hk_self.latent_hw // attn_slice.shape[1]))
         hk_self.trace._gen_idx += 1
 
-        if attn_slice.shape[-1] == hk_self.context_size and factor != 8:
+        if attn_slice.shape[-1] <= hk_self.context_size and factor != 8:
             # shape: (batch_size, 64 // factor, 64 // factor, 77)
             maps = hk_self._unravel_attn(attn_slice)
 
@@ -334,6 +358,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         maximize_with_mean =  hk_self.foc_att_args.maximize_with_mean
         step_value =  hk_self.foc_att_args.step_value
         replace_att =  hk_self.foc_att_args.replace_att
+        up_low_att = False # for a specific test that attends over uper and lower side of the image only for certain words
 
         focused_attention_mask, w_mask = focused_attention_mask
         focused_attention_mask, w_mask = torch.repeat_interleave(focused_attention_mask, self.heads, dim=0), \
@@ -350,7 +375,22 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
 
 
         # only active on the activated words -> need for better way of handling
-        if replace_att:
+        if up_low_att:
+            w_mask[w_mask.size(0)//2:, 5] = 1
+            w_mask[w_mask.size(0)//2:, 6] = 1
+            w_mask[w_mask.size(0)//2:, 8] = 2
+            w_mask[w_mask.size(0)//2:, 9] = 2
+            if w_mask.size(1) == 16:
+                w_mask[w_mask.size(0) // 2:, 11] = 1
+                w_mask[w_mask.size(0) // 2:, 12] = 2
+            mask =  ~torch.repeat_interleave(w_mask.bool().unsqueeze(1), focus_weights.size(1), dim=1)
+            focus_weights = torch.repeat_interleave(w_mask.unsqueeze(1), focus_weights.size(1), dim=1)
+            focus_weights[:, :focus_weights.size(1) // 2][focus_weights[:, :focus_weights.size(1) // 2] == 2] = 0
+            focus_weights[:, focus_weights.size(1) // 2:][focus_weights[:, focus_weights.size(1) // 2:] == 1] = 0
+            focus_weights[focus_weights > 0] = 1
+            focus_weights[mask] = 1
+
+        elif replace_att:
             mask =  ~torch.repeat_interleave(w_mask.bool().unsqueeze(1), focus_weights.size(1), dim=1)
             focus_weights[mask] = attention_scores[mask]
             attention_scores = torch.ones_like(attention_scores)
@@ -360,7 +400,8 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
                 focus_weights = focused_attention_norm(focus_weights)
             # use min-max normalization
             else:
-                focus_weights /= attention_scores[:, :, 1:].max(dim=-1, keepdim=True).values
+                focus_weights /= (attention_scores[:, :, 1:].sum(dim=-1, keepdim=True) + 1e-6)
+                #focus_weights /= attention_scores[:, :, 1:].max(dim=-1, keepdim=True).values
             focus_weights = torch.maximum(focus_weights, torch.logical_not(w_mask)[:, None, :])
 
             if maximize_over_heads:
@@ -376,11 +417,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
 
         #focus_weights /= focus_weights.max(dim=1, keepdim=True).values
 
-        '''plot_att = True
-        if plot_att == True:
-            plt.imshow(focus_weights[5, : , 5].cpu().numpy().reshape(64,64))
-            plt.show()'''
-
+        #hk_self._show_att_map(focus_weights)
         attn_slice = (focus_weights * attention_scores).softmax(dim=-1)
 
         if hk_self.save_heads:
@@ -391,6 +428,9 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         if hk_self.foc_att_args.save_cum_att:
             att_cum_unc = attn_slice[:attn_slice.size(0) // 2].mean(dim=[0, 1])
             att_cum = attn_slice[attn_slice.size(0) // 2:].mean(dim=[0, 1])
+            maps = hk_self._unravel_attn(attn_slice).transpose(0, 1)  # tokens, heads, height, width
+            maps = F.interpolate(maps, size=(64, 64), mode='bicubic')
+            hk_self.att_maps.append(maps)
             for i in range(att_cum.size(0)):
                 hk_self.att_cum.setdefault(i, []).append(att_cum[i].item())
                 hk_self.att_cum_unc.setdefault(i, []).append(att_cum_unc[i].item())
@@ -398,7 +438,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         factor = int(math.sqrt(hk_self.latent_hw // attn_slice.shape[1]))
         hk_self.trace._gen_idx += 1
 
-        if attn_slice.shape[-1] == hk_self.context_size and factor != 8:
+        if attn_slice.shape[-1] <= hk_self.context_size and factor != 8:
             # shape: (batch_size, 64 // factor, 64 // factor, 77)
             maps = hk_self._unravel_attn(attn_slice)
 
