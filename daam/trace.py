@@ -29,6 +29,7 @@ class DiffusionHeatMapHooker(AggregateHooker):
             save_heads: bool = False,
             data_dir: str = None,
             foc_att_args=None,
+            foc_att_mask=None
     ):
         self.all_heat_maps = RawHeatMapCollection()
         h = (pipeline.unet.config.sample_size * pipeline.vae_scale_factor)
@@ -50,6 +51,7 @@ class DiffusionHeatMapHooker(AggregateHooker):
                 save_heads=save_heads,
                 data_dir=data_dir,
                 foc_att_args=foc_att_args,
+                foc_att_mask=foc_att_mask,
             ) for idx, x in enumerate(self.locator.locate(pipeline.unet))
         ]
 
@@ -145,7 +147,7 @@ class DiffusionHeatMapHooker(AggregateHooker):
     def get_attention_maps(self):
         res = torch.tensor([])
         for module in self.cross_att_hookers:
-            mod_maps = torch.stack(module.att_maps, dim=0).cpu().unsqueeze(0).mean(dim=-3)
+            mod_maps = torch.stack(module.att_maps, dim=0).unsqueeze(0).mean(dim=-3)
             res = torch.cat([res, mod_maps], dim=0)
 
         res = res.permute(2,1,0,3,4) #tokens, steps, layers, height, width
@@ -196,6 +198,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
             save_heads: bool = False,
             data_dir: Union[str, Path] = None,
             foc_att_args=None,
+            foc_att_mask=None,
     ):
         super().__init__(module)
         self.heat_maps = parent_trace.all_heat_maps
@@ -208,6 +211,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         self.trace = parent_trace
 
         self.foc_att_args = foc_att_args
+        self.foc_att_mask = foc_att_mask
 
         self.att_cum = {}
         self.att_cum_unc = {}
@@ -229,6 +233,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         for i, map_ in enumerate(x):
             map_ = map_.view(h, w).cpu().numpy()
             plt.imshow(map_, cmap='hot', interpolation='nearest')
+            plt.colorbar()
             plt.title(i)
             plt.show()
 
@@ -330,7 +335,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
             att_cum = attn_slice[attn_slice.size(0) // 2:].mean(dim=[0,1])
             maps = hk_self._unravel_attn(attn_slice).transpose(0,1) #tokens, heads, height, width
             maps = F.interpolate(maps, size=(64, 64), mode='bicubic')
-            hk_self.att_maps.append(maps)
+            hk_self.att_maps.append(maps.cpu())
             for i in range(att_cum.size(0)):
                 hk_self.att_cum.setdefault(i, []).append(att_cum[i].item())
                 hk_self.att_cum_unc.setdefault(i, []).append(att_cum_unc[i].item())
@@ -357,6 +362,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         maximize_over_heads =  hk_self.foc_att_args.maximize_over_heads
         maximize_with_mean =  hk_self.foc_att_args.maximize_with_mean
         step_value =  hk_self.foc_att_args.step_value
+        foc_multiplier = hk_self.foc_att_args.foc_mupltiplier
         replace_att =  hk_self.foc_att_args.replace_att
         up_low_att = False # for a specific test that attends over uper and lower side of the image only for certain words
 
@@ -375,7 +381,24 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
 
 
         # only active on the activated words -> need for better way of handling
-        if up_low_att:
+        if hk_self.foc_att_mask is not None:
+            dim_size = int(math.sqrt(attention_scores.size(1)))
+            assert hk_self.foc_att_mask.size(-1) % dim_size == 0
+            ds_ratio = hk_self.foc_att_mask.size(-1) // dim_size
+            if ds_ratio > 1:
+                maxpool = torch.nn.MaxPool2d(ds_ratio, stride=ds_ratio)
+                hk_self.foc_att_mask = maxpool(hk_self.foc_att_mask)
+            foc_att_mask = hk_self.foc_att_mask.view(1, key.size(1), dim_size**2)
+            foc_att_mask = torch.repeat_interleave(foc_att_mask, self.heads, dim=0)
+            foc_att_mask = torch.vstack([torch.zeros_like(foc_att_mask), foc_att_mask]).transpose(1,2).to(focused_attention_mask.device)
+            focus_weights = torch.bmm(foc_att_mask, focused_attention_mask)
+            focus_weights = torch.clamp(focus_weights, min=0)
+            focus_weights /= (focus_weights[:, :, :].max(dim=1, keepdim=True)[0] + 1e-6)
+            if step_value is not None:
+                focus_weights = torch.where(focus_weights > step_value, torch.ones_like(focus_weights), torch.zeros_like(focus_weights))
+            focus_weights *= foc_multiplier
+            focus_weights = torch.maximum(focus_weights, torch.logical_not(w_mask)[:, None, :])
+        elif up_low_att:
             w_mask[w_mask.size(0)//2:, 5] = 1
             w_mask[w_mask.size(0)//2:, 6] = 1
             w_mask[w_mask.size(0)//2:, 8] = 2
@@ -430,7 +453,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
             att_cum = attn_slice[attn_slice.size(0) // 2:].mean(dim=[0, 1])
             maps = hk_self._unravel_attn(attn_slice).transpose(0, 1)  # tokens, heads, height, width
             maps = F.interpolate(maps, size=(64, 64), mode='bicubic')
-            hk_self.att_maps.append(maps)
+            hk_self.att_maps.append(maps.cpu())
             for i in range(att_cum.size(0)):
                 hk_self.att_cum.setdefault(i, []).append(att_cum[i].item())
                 hk_self.att_cum_unc.setdefault(i, []).append(att_cum_unc[i].item())
